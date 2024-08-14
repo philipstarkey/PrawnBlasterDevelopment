@@ -53,6 +53,8 @@ constexpr unsigned int wait_array_size = max_waits + 4;
 unsigned int instructions[instruction_array_size];
 // max_waits + 4
 unsigned int waits[wait_array_size];
+// Storage for the number of instructions for each pseudoclock
+unsigned int num_pseudoclock_instructions[4];
 
 #define SERIAL_BUFFER_SIZE 256
 char readstring[SERIAL_BUFFER_SIZE] = "";
@@ -120,7 +122,7 @@ void set_status(int new_status)
     mutex_exit(&status_mutex);
 }
 
-bool configure_pseudoclock_pio_sm(pseudoclock_config *config, uint prog_offset, uint32_t hwstart, int max_instructions_per_pseudoclock, int max_waits_per_pseudoclock)
+bool configure_pseudoclock_pio_sm(pseudoclock_config *config, uint prog_offset, uint32_t hwstart, int max_waits_per_pseudoclock)
 {
     // Zero out waits array
     int max_waits = (max_waits_per_pseudoclock + 1);
@@ -133,12 +135,14 @@ bool configure_pseudoclock_pio_sm(pseudoclock_config *config, uint prog_offset, 
     int words_to_send = 0;
     int wait_count = 1; // We always send a stop message
     bool previous_instruction_was_wait = false;
-    int max_words = (max_instructions_per_pseudoclock * 2 + 2);
-    for (int i = config->sm * max_words; i < ((config->sm + 1) * max_words); i += 2)
+    int max_words = num_pseudoclock_instructions[config->sm]; 
+    unsigned int instruction_start_address = pseudoclock_instruction_start_addr(config->sm);
+    unsigned int maximum_pseudoclock_instructions = num_pseudoclock_instructions[config->sm];
+    for (int i = instruction_start_address; i < (instruction_start_address + maximum_pseudoclock_instructions); i += 2)
     {
         if (instructions[i] == 0 && instructions[i + 1] == 0)
         {
-            words_to_send = i + 2 - config->sm * max_words;
+            words_to_send = i + 2 - instruction_start_address;
             break;
         }
         else if (instructions[i] == 0)
@@ -296,7 +300,7 @@ bool configure_pseudoclock_pio_sm(pseudoclock_config *config, uint prog_offset, 
         config->instructions_dma_channel,      // The DMA channel
         &instruction_c,                        // DMA channel config
         &config->pio->txf[config->sm],         // Write address to the PIO TX FIFO
-        &instructions[config->sm * max_words], // Read address to the instruction array
+        &instructions[instruction_start_address], // Read address to the instruction array
         words_to_send,                         // How many values to transfer
         true                                   // Start immediately
     );
@@ -474,6 +478,76 @@ void free_pseudoclock_pio_sm(pseudoclock_config *config)
 //     }
 // }
 
+void reset_instructions() {
+    for (int i = 0; i < instruction_array_size; i++) {
+        instructions[i] = 0;
+    }
+}
+
+void update_default_num_pseudoclock_instructions() {
+    // TODO: This fails because initially, all instructions will be allocated to pseudoclock 0. Which means none will be available to the other pseudoclocks. Need to fix that. Probably means changing the number of pseudoclocks will reset the number of instructions on each pseudoclock.
+    unsigned int total_number_of_instructions = 0;
+    for (int i = 0; i < 4; i++) {
+        if (i < num_pseudoclocks_in_use) {
+            // If the pseudoclock is in use and doesn't have a number of instructions
+            // set, then set a default based on the number of remaining instructions
+            if (convert_instruction_count_to_prawnblaster_instruction_count(num_pseudoclock_instructions[i]) == 0) {
+                // Determine available number of instructions used so far
+                unsigned int used_instructions = pseudoclock_instruction_start_addr(i);
+                unsigned int remaining_instructions = instruction_array_size - used_instructions;
+                // Divide the remaining instructions evenly across the pseudoclocks
+                num_pseudoclock_instructions[i] = (unsigned int)(remaining_instructions/(num_pseudoclocks_in_use - i))
+            }
+        } else {
+            // This pseudoclock is not in use, so clear the number of instruction storage.
+            set_num_prawnblaster_instructions(i, 0);
+        }
+    }
+}
+
+unsigned int pseudoclock_instruction_start_addr(int pseudoclock) {
+    unsigned int addr = 0;
+    for (int i = 0; i < pseudoclock; i++) {
+        addr += num_pseudoclock_instructions[i];
+    }
+    return addr;
+}
+
+// Get the number of free instructions available to a pseudoclock
+unsigned int num_free_prawnblaster_instructions(int pseudoclock) {
+    unsigned int reserved_instructions = 0;
+    for (int i = 0; i < num_pseudoclocks_in_use; i++) {
+        if (i != pseudoclock) {
+            reserved_instructions += num_pseudoclock_instructions[i];
+        }
+    }
+    // The number of PrawnBlaster instructions available to this pseudoclock is thus
+    // half of: the number of instructions available in total in the array, minus the
+    // number currently assigned to other pseudoclocks, minus two to indicate a stop
+    // instruction at the end (that can't be written to)
+    return convert_instruction_count_to_prawnblaster_instruction_count(instruction_array_size - reserved_instructions);
+}
+
+void set_num_prawnblaster_instructions(int pseudoclock, unsigned int num_instructions) {
+    // Double the instruction count to convert between PrawnBlaster instruction and our
+    // instruction storaged (a PrawnBlaster instructions in 2x 32-bit integers). Assign
+    // an extra two instructions to account for the required stop instruction at the end
+    // that is not writable.
+    num_pseudoclock_instructions[pseudoclock] = convert_prawnblaster_instruction_count_to_instruction_count(num_instructions);
+}
+
+unsigned int get_num_prawnblaster_instructions(int pseudoclock) {
+    return convert_instruction_count_to_prawnblaster_instruction_count(num_pseudoclock_instructions[pseudoclock]);
+}
+
+unsigned int convert_prawnblaster_instruction_count_to_instruction_count(unsigned int prawnblaster_instruction_count) {
+    return 2 * prawnblaster_instruction_count + 2;
+}
+
+unsigned int convert_instruction_count_to_prawnblaster_instruction_count(unsigned int instruction_count) {
+    return (unsigned int)((instruction_count - 2) / 2);
+}
+
 bool pin_in_use(int pin)
 {
     // Check in pin is in use
@@ -588,7 +662,7 @@ void core1_entry()
             pseudoclock_configs[i].sm = i;
             pseudoclock_configs[i].OUT_PIN = OUT_PINS[i];
             pseudoclock_configs[i].IN_PIN = IN_PINS[i];
-            success = configure_pseudoclock_pio_sm(&pseudoclock_configs[i], offset, hwstart, max_instructions / num_pseudoclocks_in_use, max_waits / num_pseudoclocks_in_use);
+            success = configure_pseudoclock_pio_sm(&pseudoclock_configs[i], offset, hwstart, max_waits / num_pseudoclocks_in_use);
             if (!success)
             {
                 if (DEBUG)
@@ -868,7 +942,7 @@ void loop()
     else if (strncmp(readstring, "setnumpseudoclocks", 17) == 0)
     {
         unsigned int num_pseudoclocks;
-        int parsed = sscanf(readstring, "%*s %u %u", &num_pseudoclocks);
+        int parsed = sscanf(readstring, "%*s %u", &num_pseudoclocks);
         if (parsed < 1)
         {
             fast_serial_printf("invalid request\r\n");
@@ -887,13 +961,45 @@ void loop()
             {
                 waits[i] = 0;
             }
-            // reset instructions
-            for (int i = 0; i < max_instructions * 2 + 8; i++)
-            {
-                instructions[i] = 0;
-            }
+            // Update the number of pseudoclocks
             num_pseudoclocks_in_use = num_pseudoclocks;
+            // reset instructions
+            reset_instructions();
+            // Update the number of instructions
+            update_default_num_pseudoclock_instructions();
             fast_serial_printf("ok\r\n");
+        }
+    }
+    // Set number of instructions for a pseudoclock
+    else if (strncmp(readstring, "setnuminstructions", 18) == 0)
+    {
+        unsigned int num_instructions;
+        unsigned int pseudoclock;
+        int parsed = sscanf(readstring, "%*s %u %u", &pseudoclock, &num_instructions);
+        if (parsed < 2)
+        {
+            fast_serial_printf("invalid request\r\n");
+        }
+        else if (pseudoclock < 0 || pseudoclock > 3)
+        {
+            fast_serial_printf("The specified pseudoclock must be between 0 and 3 (inclusive)\r\n");
+        }
+        else if (pseudoclock >= num_pseudoclocks_in_use)
+        {
+            fast_serial_printf("The specified pseudoclock must be enabled using setnumpseudoclocks\r\n");
+        }
+        else if (num_instructions <= 0) 
+        {
+            fast_serial_printf("The number of instructions must be greater than 0\r\n");
+        }
+        else if (num_instructions > num_free_prawnblaster_instructions(pseudoclock))
+        {
+            fast_serial_printf("The number of instructions cannot be greated than the number of remaining instructions (%u)\r\n", num_free_prawnblaster_instructions(pseudoclock));
+        }
+        else
+        {
+            set_num_prawnblaster_instructions(pseudoclock, num_instructions);
+            reset_instructions();
         }
     }
     else if (strncmp(readstring, "setinpin", 8) == 0)
@@ -1140,7 +1246,8 @@ void loop()
         unsigned int reps;
         unsigned int pseudoclock;
         int parsed = sscanf(readstring, "%*s %u %u %u %u", &pseudoclock, &addr, &half_period, &reps);
-        int address_offset = pseudoclock * (max_instructions * 2 / num_pseudoclocks_in_use + 2);
+        unsigned int address_offset = pseudoclock_instruction_start_addr(pseudoclock);
+        unsigned int max_pseudoclock_instructions = get_num_prawnblaster_instructions(pseudoclock);
         if (parsed < 4)
         {
             fast_serial_printf("invalid request\n");
@@ -1149,9 +1256,13 @@ void loop()
         {
             fast_serial_printf("The specified pseudoclock must be between 0 and 3 (inclusive)\r\n");
         }
-        else if (addr >= max_instructions)
+        else if (pseudoclock >= num_pseudoclocks_in_use)
         {
-            fast_serial_printf("invalid address\r\n");
+            fast_serial_printf("The specified pseudoclock must be enabled using setnumpseudoclocks\r\n");
+        }
+        else if (addr >= max_pseudoclock_instructions)
+        {
+            fast_serial_printf("invalid address for pseudoclock %u. Must be less than %u\r\n", pseudoclock, max_pseudoclock_instructions);
         }
         else if (reps == 0)
         {
@@ -1199,7 +1310,8 @@ void loop()
         unsigned int addr;
         unsigned int pseudoclock;
         int parsed = sscanf(readstring, "%*s %u %u", &pseudoclock, &addr);
-        int address_offset = pseudoclock * (max_instructions * 2 / num_pseudoclocks_in_use + 2);
+        unsigned int address_offset = pseudoclock_instruction_start_addr(pseudoclock);
+        unsigned int max_pseudoclock_instructions = get_num_prawnblaster_instructions(pseudoclock);
         if (parsed < 2)
         {
             fast_serial_printf("invalid request\r\n");
@@ -1208,9 +1320,13 @@ void loop()
         {
             fast_serial_printf("The specified pseudoclock must be between 0 and 3 (inclusive)\r\n");
         }
-        else if (addr >= max_instructions)
+        else if (pseudoclock >= num_pseudoclocks_in_use)
         {
-            fast_serial_printf("invalid address\r\n");
+            fast_serial_printf("The specified pseudoclock must be enabled using setnumpseudoclocks\r\n");
+        }
+        else if (addr >= max_pseudoclock_instructions)
+        {
+            fast_serial_printf("invalid address for pseudoclock %u. Must be less than %u\r\n", pseudoclock, max_pseudoclock_instructions);
         }
         else
         {
@@ -1241,7 +1357,8 @@ void loop()
         unsigned int inst_count;
         unsigned int pseudoclock;
         int parsed = sscanf(readstring, "%*s %u %u %u", &pseudoclock, &start_addr, &inst_count);
-        int address_offset = pseudoclock * (max_instructions * 2 / num_pseudoclocks_in_use + 2);
+        unsigned int address_offset = pseudoclock_instruction_start_addr(pseudoclock);
+        unsigned int max_pseudoclock_instructions = get_num_prawnblaster_instructions(pseudoclock);
         if (parsed < 3)
         {
             fast_serial_printf("invalid request\n");
@@ -1250,7 +1367,11 @@ void loop()
         {
             fast_serial_printf("The specified pseudoclock must be between 0 and 3 (inclusive)\r\n");
         }
-        else if (start_addr + inst_count >= max_instructions)
+        else if (pseudoclock >= num_pseudoclocks_in_use)
+        {
+            fast_serial_printf("The specified pseudoclock must be enabled using setnumpseudoclocks\r\n");
+        }
+        else if (start_addr + inst_count >= max_pseudoclock_instructions)
         {
             fast_serial_printf("Invalid address and/or too many instructions (%d + %d).\r\n", start_addr, inst_count);
         }
@@ -1446,6 +1567,11 @@ int main()
     }
     // start with only one in use
     num_pseudoclocks_in_use = 1;
+    // reset instruction array to 0
+    reset_instructions();
+    // Update the number of instructions available to the pseudoclock
+    update_default_num_pseudoclock_instructions();
+    // Set PIO core
     pio_to_use = pio0;
 
     // initialise the status mutex
