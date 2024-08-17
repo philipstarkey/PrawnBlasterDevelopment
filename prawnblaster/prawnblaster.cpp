@@ -106,6 +106,70 @@ struct pseudoclock_config
     bool configured;
 };
 
+
+// Instruction storage utilities
+
+unsigned int convert_prawnblaster_instruction_count_to_instruction_count(unsigned int prawnblaster_instruction_count) {
+    return 2 * prawnblaster_instruction_count + 2;
+}
+
+unsigned int convert_instruction_count_to_prawnblaster_instruction_count(unsigned int instruction_count) {
+    return (unsigned int)((instruction_count - 2) / 2);
+}
+
+void set_num_prawnblaster_instructions(int pseudoclock, unsigned int num_instructions) {
+    // Double the instruction count to convert between PrawnBlaster instruction and our
+    // instruction storaged (a PrawnBlaster instructions in 2x 32-bit integers). Assign
+    // an extra two instructions to account for the required stop instruction at the end
+    // that is not writable.
+    num_pseudoclock_instructions[pseudoclock] = convert_prawnblaster_instruction_count_to_instruction_count(num_instructions);
+}
+
+unsigned int get_num_prawnblaster_instructions(int pseudoclock) {
+    return convert_instruction_count_to_prawnblaster_instruction_count(num_pseudoclock_instructions[pseudoclock]);
+}
+
+void reset_instructions() {
+    for (int i = 0; i < instruction_array_size; i++) {
+        instructions[i] = 0;
+    }
+}
+
+void reset_default_num_pseudoclock_instructions() {
+    unsigned int instructions_per_pseudoclock = (unsigned int) max_instructions / num_pseudoclocks_in_use;
+    for (int i = 0; i < 4; i++) {
+        if (i < num_pseudoclocks_in_use) {
+            set_num_prawnblaster_instructions(i, instructions_per_pseudoclock);
+        } else {
+            // This pseudoclock is not in use, so clear the number of instruction storage.
+            set_num_prawnblaster_instructions(i, 0);
+        }
+    }
+}
+
+unsigned int pseudoclock_instruction_start_addr(int pseudoclock) {
+    unsigned int addr = 0;
+    for (int i = 0; i < pseudoclock; i++) {
+        addr += num_pseudoclock_instructions[i];
+    }
+    return addr;
+}
+
+// Get the number of free instructions available to a pseudoclock
+unsigned int num_free_prawnblaster_instructions(int pseudoclock) {
+    unsigned int reserved_instructions = 0;
+    for (int i = 0; i < num_pseudoclocks_in_use; i++) {
+        if (i != pseudoclock) {
+            reserved_instructions += num_pseudoclock_instructions[i];
+        }
+    }
+    // The number of PrawnBlaster instructions available to this pseudoclock is thus
+    // half of: the number of instructions available in total in the array, minus the
+    // number currently assigned to other pseudoclocks, minus two to indicate a stop
+    // instruction at the end (that can't be written to)
+    return convert_instruction_count_to_prawnblaster_instruction_count(instruction_array_size - reserved_instructions);
+}
+
 // Thread safe functions for getting/setting status
 int get_status()
 {
@@ -477,76 +541,6 @@ void free_pseudoclock_pio_sm(pseudoclock_config *config)
 
 //     }
 // }
-
-void reset_instructions() {
-    for (int i = 0; i < instruction_array_size; i++) {
-        instructions[i] = 0;
-    }
-}
-
-void update_default_num_pseudoclock_instructions() {
-    // TODO: This fails because initially, all instructions will be allocated to pseudoclock 0. Which means none will be available to the other pseudoclocks. Need to fix that. Probably means changing the number of pseudoclocks will reset the number of instructions on each pseudoclock.
-    unsigned int total_number_of_instructions = 0;
-    for (int i = 0; i < 4; i++) {
-        if (i < num_pseudoclocks_in_use) {
-            // If the pseudoclock is in use and doesn't have a number of instructions
-            // set, then set a default based on the number of remaining instructions
-            if (convert_instruction_count_to_prawnblaster_instruction_count(num_pseudoclock_instructions[i]) == 0) {
-                // Determine available number of instructions used so far
-                unsigned int used_instructions = pseudoclock_instruction_start_addr(i);
-                unsigned int remaining_instructions = instruction_array_size - used_instructions;
-                // Divide the remaining instructions evenly across the pseudoclocks
-                num_pseudoclock_instructions[i] = (unsigned int)(remaining_instructions/(num_pseudoclocks_in_use - i))
-            }
-        } else {
-            // This pseudoclock is not in use, so clear the number of instruction storage.
-            set_num_prawnblaster_instructions(i, 0);
-        }
-    }
-}
-
-unsigned int pseudoclock_instruction_start_addr(int pseudoclock) {
-    unsigned int addr = 0;
-    for (int i = 0; i < pseudoclock; i++) {
-        addr += num_pseudoclock_instructions[i];
-    }
-    return addr;
-}
-
-// Get the number of free instructions available to a pseudoclock
-unsigned int num_free_prawnblaster_instructions(int pseudoclock) {
-    unsigned int reserved_instructions = 0;
-    for (int i = 0; i < num_pseudoclocks_in_use; i++) {
-        if (i != pseudoclock) {
-            reserved_instructions += num_pseudoclock_instructions[i];
-        }
-    }
-    // The number of PrawnBlaster instructions available to this pseudoclock is thus
-    // half of: the number of instructions available in total in the array, minus the
-    // number currently assigned to other pseudoclocks, minus two to indicate a stop
-    // instruction at the end (that can't be written to)
-    return convert_instruction_count_to_prawnblaster_instruction_count(instruction_array_size - reserved_instructions);
-}
-
-void set_num_prawnblaster_instructions(int pseudoclock, unsigned int num_instructions) {
-    // Double the instruction count to convert between PrawnBlaster instruction and our
-    // instruction storaged (a PrawnBlaster instructions in 2x 32-bit integers). Assign
-    // an extra two instructions to account for the required stop instruction at the end
-    // that is not writable.
-    num_pseudoclock_instructions[pseudoclock] = convert_prawnblaster_instruction_count_to_instruction_count(num_instructions);
-}
-
-unsigned int get_num_prawnblaster_instructions(int pseudoclock) {
-    return convert_instruction_count_to_prawnblaster_instruction_count(num_pseudoclock_instructions[pseudoclock]);
-}
-
-unsigned int convert_prawnblaster_instruction_count_to_instruction_count(unsigned int prawnblaster_instruction_count) {
-    return 2 * prawnblaster_instruction_count + 2;
-}
-
-unsigned int convert_instruction_count_to_prawnblaster_instruction_count(unsigned int instruction_count) {
-    return (unsigned int)((instruction_count - 2) / 2);
-}
 
 bool pin_in_use(int pin)
 {
@@ -965,8 +959,8 @@ void loop()
             num_pseudoclocks_in_use = num_pseudoclocks;
             // reset instructions
             reset_instructions();
-            // Update the number of instructions
-            update_default_num_pseudoclock_instructions();
+            // Reset the number of instructions per pseudoclock to the default for this number of pseudoclocks
+            reset_default_num_pseudoclock_instructions();
             fast_serial_printf("ok\r\n");
         }
     }
@@ -1570,7 +1564,7 @@ int main()
     // reset instruction array to 0
     reset_instructions();
     // Update the number of instructions available to the pseudoclock
-    update_default_num_pseudoclock_instructions();
+    reset_default_num_pseudoclock_instructions();
     // Set PIO core
     pio_to_use = pio0;
 
