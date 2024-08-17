@@ -1411,7 +1411,7 @@ void loop()
                             instructions[address_offset + addr * 2 + 1] = (half_period - 4) / 2;
                             addr++;
                         }
-                    else
+                        else
                         {
                             reps_error_count++;
                             last_reps_error_idx = (address_offset + addr * 2 + 1) / 2;
